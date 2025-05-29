@@ -1,0 +1,21 @@
+[package]
+name = "match_engine"
+version.workspace = true
+edition = "2021"
+description = "High-performance order matching engine for financial trading systems"
+license = "MIT OR Apache-2.0"
+keywords = ["trading", "orderbook", "matching", "finance", "exchange"]
+categories = ["algorithms", "data-structures"]
+readme = "README.md"
+
+[lib]
+name = "match_engine"
+crate-type = ["lib"]
+
+[dependencies]
+tokio.workspace = true
+crossbeam-channel = "0.5.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1.0"
+anyhow = "1.0"

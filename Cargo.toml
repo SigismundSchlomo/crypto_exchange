@@ -1,0 +1,17 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["match_engine"]
+resolver = "2"
+
+[workspace.dependencies]
+match_engine = { path = "match_engine" }
+
+tokio = { version = "1.45.0", features = ["full"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1.0"
+anyhow = "1.0"
