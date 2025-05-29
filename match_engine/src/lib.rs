@@ -8,9 +8,6 @@ pub use engine::{MatchingEngine, Order, Side, Trade};
 // Error handling
 pub use errors::{EngineError, IntoAnyhow};
 
-// Additional types for advanced usage
-pub use types::InternalEvents;
-
 /// Type alias for order identifiers
 pub type OrderId = u64;
 

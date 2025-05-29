@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 pub type Price = u64;
 pub type OrderId = u64;
 pub type TradeId = u64;
+pub type Amount = u64;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Side {
@@ -58,31 +59,25 @@ pub enum Side {
 }
 
 #[derive(Debug, Clone)]
-pub struct NewOrder {
+pub struct Order {
     pub side: Side,
     //TODO: Work on decimals processing - use rust decimal crate
-    pub price: u64,
+    pub price: Price,
     pub amount: u64,
 }
 
 #[derive(Debug, Clone)]
 pub enum OrderEvent {
-    New(Box<NewOrder>),
+    New(Box<Order>),
     Cancel(OrderId),
 }
 
 pub enum MarketEvent {
-    Trade,
-    OrderCancelled,
-    OrderFilled,
-    OrderPartiallyFilled,
-}
-
-/// A single order in the book
-#[derive(Debug, Clone)]
-pub struct Order {
-    pub id: OrderId,
-    pub quantity: u64,
+    Trade(Box<Trade>),
+    OrderCancelled(OrderId),
+    OrderFilled(OrderId),
+    OrderPartiallyFilled(OrderId),
+    OrderPlaced(Box<(OrderId, Order)>),
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +98,7 @@ pub struct FillResult {
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
     pub quantity: u64,
-    pub orders: VecDeque<Box<Order>>,
+    pub orders: VecDeque<(OrderId, Amount)>,
     pub order_count: u64,
 }
 
@@ -117,6 +112,12 @@ impl PriceLevel {
         }
     }
 
+    pub fn add_order(&mut self, order_id: OrderId, amount: Amount) {
+        self.orders.push_back((order_id, amount));
+        self.order_count += 1;
+        self.quantity += amount;
+    }
+
     // When we filling the order, the next thinks could happen
     // - The order is filled completely
     // - The order is partially filled
@@ -127,7 +128,7 @@ impl PriceLevel {
     // Also, it may contain the id of the order that was partially filled.
     // So, we must return enough information to generate events about all the state change
 
-    pub fn try_fill(&mut self, order: &NewOrder) -> Option<FillResult> {
+    pub fn try_fill(&mut self, order: &Order) -> Option<FillResult> {
         let mut trades = Vec::new();
         let mut filled_orders = Vec::new();
         let mut partially_filled_order = None;
@@ -135,18 +136,18 @@ impl PriceLevel {
         let mut trade_id = 0;
 
         while remaining_amount > 0 && !self.orders.is_empty() {
-            let mut current_order = self.orders.pop_front()?;
+            let (current_id, mut current_amount) = self.orders.pop_front()?;
 
             //TODO: Use fixed point arithmetic
-            if current_order.quantity <= remaining_amount {
-                let trade_amount = current_order.quantity;
+            if current_amount <= remaining_amount {
+                let trade_amount = current_amount;
 
                 trades.push(Trade {
                     id: trade_id,
                     price: order.price,
                     amount: trade_amount,
                 });
-                filled_orders.push(current_order.id);
+                filled_orders.push(current_id);
                 remaining_amount -= trade_amount;
                 self.quantity -= trade_amount;
                 self.order_count -= 1;
@@ -162,10 +163,10 @@ impl PriceLevel {
                 });
 
                 //Update the current order's quantity and put it back
-                current_order.quantity -= trade_amount;
+                current_amount -= trade_amount;
                 //TODO: Store the special type instead of the order id
-                partially_filled_order = Some(current_order.id);
-                self.orders.push_front(current_order);
+                partially_filled_order = Some(current_id);
+                self.orders.push_front((current_id, current_amount));
 
                 self.quantity -= trade_amount;
                 remaining_amount = 0;
@@ -179,13 +180,6 @@ impl PriceLevel {
             partially_filled_order,
             remaining_amount,
         })
-    }
-}
-
-impl Order {
-    /// Create a new order with the given parameters.
-    pub fn new(id: OrderId, quantity: u64) -> Self {
-        Self { id, quantity }
     }
 }
 
@@ -235,7 +229,9 @@ impl MatchingEngine {
         }
     }
 
-    fn process_new_order(&mut self, new_order: &NewOrder) {
+    // This function must return a bunch of MarketEvents, that are represents the state changes.
+
+    fn process_new_order(&mut self, new_order: &Order) {
         match new_order.side {
             Side::Bid => {
                 self.process_buy_order(new_order);
@@ -247,7 +243,46 @@ impl MatchingEngine {
         }
     }
 
-    fn process_buy_order(&mut self, order: &NewOrder) {}
+    // When we got a new buy order, we could have such events
+    // - The best ask price is higher than the order price, so we need to store order
+    // - The best ask price is lower of equal to the order price, so we can try to fill the order
+    // As a result, we can get a FillResult, if not - the order is stored
+
+    fn process_buy_order(&mut self, order: &Order) -> Vec<MarketEvent> {
+        // The None basically means that there are no asks in the order book
+        let mut events = Vec::new();
+        match self.asks.iter_mut().next() {
+            Some((price, level)) if price <= &order.price => {
+                let fill_result = level.try_fill(order);
+                //TODO: Store the reminder of the order
+                //TODO: Convert fill result to events
+            }
+            _ => {
+                let order_id = self.insert_bid(&order.price, order.amount);
+                events.push(MarketEvent::OrderPlaced(Box::new((
+                    order_id,
+                    order.clone(),
+                ))))
+            }
+        }
+        events
+    }
 
     fn process_cancel_order(&mut self, order_id: &OrderId) {}
+
+    fn insert_bid(&mut self, price: &Price, amount: u64) -> OrderId {
+        //TODO: Generate order id with uuid;
+        let order_id = 1;
+        match self.bids.get_mut(price) {
+            Some(level) => {
+                level.add_order(order_id, amount);
+            }
+            None => {
+                let mut level = PriceLevel::new();
+                level.add_order(order_id, amount);
+                self.bids.insert(*price, level);
+            }
+        }
+        order_id
+    }
 }
