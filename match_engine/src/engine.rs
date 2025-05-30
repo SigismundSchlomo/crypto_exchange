@@ -94,6 +94,22 @@ pub struct FillResult {
     pub remaining_amount: u64,
 }
 
+impl FillResult {
+    pub fn into_events(self) -> Vec<MarketEvent> {
+        let mut events = Vec::new();
+        self.trades.into_iter().for_each(|trade| {
+            events.push(MarketEvent::Trade(Box::new(trade)));
+        });
+        self.filled_orders.into_iter().for_each(|id| {
+            events.push(MarketEvent::OrderFilled(id));
+        });
+        self.partially_filled_order.into_iter().for_each(|id| {
+            events.push(MarketEvent::OrderPartiallyFilled(id));
+        });
+        events
+    }
+}
+
 /// Represents a price level in the order book with aggregated information
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
@@ -243,26 +259,22 @@ impl MatchingEngine {
         }
     }
 
-    // When we got a new buy order, we could have such events
-    // - The best ask price is higher than the order price, so we need to store order
-    // - The best ask price is lower of equal to the order price, so we can try to fill the order
-    // As a result, we can get a FillResult, if not - the order is stored
-
     fn process_buy_order(&mut self, order: &Order) -> Vec<MarketEvent> {
-        // The None basically means that there are no asks in the order book
         let mut events = Vec::new();
         match self.asks.iter_mut().next() {
             Some((price, level)) if price <= &order.price => {
-                let fill_result = level.try_fill(order);
-                //TODO: Store the reminder of the order
-                //TODO: Convert fill result to events
+                if let Some(fill_result) = level.try_fill(order) {
+                    //Creating a order with the unfilled part
+                    if fill_result.remaining_amount > 0 {
+                        self.insert_bid(order.price, fill_result.remaining_amount, &mut events);
+                    }
+                    events.append(&mut fill_result.into_events());
+                } else {
+                    self.insert_bid(order.price, order.amount, &mut events);
+                }
             }
             _ => {
-                let order_id = self.insert_bid(&order.price, order.amount);
-                events.push(MarketEvent::OrderPlaced(Box::new((
-                    order_id,
-                    order.clone(),
-                ))))
+                self.insert_bid(order.price, order.amount, &mut events);
             }
         }
         events
@@ -270,19 +282,26 @@ impl MatchingEngine {
 
     fn process_cancel_order(&mut self, order_id: &OrderId) {}
 
-    fn insert_bid(&mut self, price: &Price, amount: u64) -> OrderId {
+    fn insert_bid(&mut self, price: Price, amount: u64, events: &mut Vec<MarketEvent>) {
         //TODO: Generate order id with uuid;
         let order_id = 1;
-        match self.bids.get_mut(price) {
+        match self.bids.get_mut(&price) {
             Some(level) => {
                 level.add_order(order_id, amount);
             }
             None => {
                 let mut level = PriceLevel::new();
                 level.add_order(order_id, amount);
-                self.bids.insert(*price, level);
+                self.bids.insert(price, level);
             }
         }
-        order_id
+        events.push(MarketEvent::OrderPlaced(Box::new((
+            order_id,
+            Order {
+                side: Side::Bid,
+                price,
+                amount,
+            },
+        ))));
     }
 }
