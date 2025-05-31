@@ -8,3 +8,8 @@
 - [] Use crossbeam channel to communicate between engine and event processor task
 - [] Generate order id using uuid crate
 - [] Work on graceful shutdown to prevent data loss
+- [] Implement order cancelation processing
+- [] Implement engine state restoration mechanism
+- [] Use fixed point arithmetics for inside the engine
+- [] Refactor - move some types form engine to separate module
+- [] Improve error handling - send signal to restart engine from last known state on error
