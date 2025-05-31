@@ -199,6 +199,24 @@ impl PriceLevel {
     }
 }
 
+pub struct IdGenerator {
+    next_id: u64,
+}
+
+//TODO: Move to separate file
+//IdGenerator must be initializable and restorable from the last known id
+impl IdGenerator {
+    pub fn new(init_id: u64) -> Self {
+        IdGenerator { next_id: init_id }
+    }
+
+    pub fn next(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
 pub struct MatchingEngine {
     /// Buy orders sorted by price (highest first) then time priority
     bids: BTreeMap<Price, PriceLevel>,
@@ -206,6 +224,7 @@ pub struct MatchingEngine {
     asks: BTreeMap<Price, PriceLevel>,
     /// Index for fast order lookup by ID
     id_index: HashMap<OrderId, (Price, Side)>,
+    id_generator: IdGenerator,
     price_decimals: u64,
     base_decimals: u64,
     quote_decimals: u64,
@@ -218,11 +237,17 @@ pub struct MatchingEngine {
 
 impl MatchingEngine {
     /// Create a new matching engine with empty order books.
-    pub fn new(price_decimals: u64, base_decimals: u64, quote_decimals: u64) -> Self {
+    pub fn new(
+        id_generator: IdGenerator,
+        price_decimals: u64,
+        base_decimals: u64,
+        quote_decimals: u64,
+    ) -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             id_index: HashMap::new(),
+            id_generator,
             price_decimals,
             base_decimals,
             quote_decimals,
@@ -303,8 +328,7 @@ impl MatchingEngine {
     fn process_cancel_order(&mut self, order_id: &OrderId) {}
 
     fn insert_bid(&mut self, price: Price, amount: u64, events: &mut Vec<MarketEvent>) {
-        //TODO: Generate order id with uuid;
-        let order_id = 1;
+        let order_id = self.id_generator.next();
         match self.bids.get_mut(&price) {
             Some(level) => {
                 level.add_order(order_id, amount);
@@ -326,7 +350,7 @@ impl MatchingEngine {
     }
 
     fn insert_ask(&mut self, price: Price, amount: u64, events: &mut Vec<MarketEvent>) {
-        let order_id = 1;
+        let order_id = self.id_generator.next();
         match self.asks.get_mut(&price) {
             Some(level) => {
                 level.add_order(order_id, amount);
