@@ -4,19 +4,11 @@
 //! for processing trading orders and generating trades.
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use tracing::warn;
+
+use crate::errors::EngineError;
 
 // The matching engine must process incoming events and generate outcoming events
-//
-// OrderEvent
-// - NewOrder
-// - CancelOrder
-//
-// MarketEvent
-// - Trade
-// - OrderCancelled
-// - OrderPartialMatched
-// - OrderFilled
-//
 
 // engine recieves orders, and tries to make a match on each new order
 // to perform order cancellation engine store index of orders to search them
@@ -60,10 +52,22 @@ pub enum Side {
 
 #[derive(Debug, Clone)]
 pub struct Order {
+    pub id: OrderId,
     pub side: Side,
     //TODO: Work on decimals processing - use rust decimal crate
     pub price: Price,
     pub amount: u64,
+}
+
+impl Order {
+    pub fn new(id: OrderId, side: Side, price: Price, amount: u64) -> Self {
+        Order {
+            id,
+            side,
+            price,
+            amount,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +81,8 @@ pub enum MarketEvent {
     OrderCancelled(OrderId),
     OrderFilled(OrderId),
     OrderPartiallyFilled(OrderId),
-    OrderPlaced(Box<(OrderId, Order)>),
+    OrderPlaced(OrderId),
+    OrderUpdated(OrderId),
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +137,42 @@ impl PriceLevel {
         self.orders.push_back((order_id, amount));
         self.order_count += 1;
         self.quantity += amount;
+    }
+
+    pub fn remove_order(&mut self, order_id: OrderId) -> Result<(), EngineError> {
+        let mut found = false;
+        self.orders.retain(|(id, amount)| {
+            if *id == order_id && !found {
+                self.quantity -= *amount;
+                self.order_count -= 1;
+                found = true;
+                false // remove
+            } else {
+                true // keep
+            }
+        });
+        if !found {
+            Err(EngineError::OrderNotFound(order_id))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn update_order(&mut self, order_id: OrderId, new_amount: u64) -> Result<(), EngineError> {
+        let mut found = false;
+        self.orders.iter_mut().for_each(|(id, amount)| {
+            if *id == order_id {
+                self.quantity -= *amount;
+                self.quantity += new_amount;
+                found = true;
+                *amount = new_amount;
+            }
+        });
+        if !found {
+            Err(EngineError::OrderNotFound(order_id))
+        } else {
+            Ok(())
+        }
     }
 
     // When we filling the order, the next thinks could happen
@@ -290,15 +331,20 @@ impl MatchingEngine {
                 if let Some(fill_result) = level.try_fill(order) {
                     //Creating a order with the unfilled part
                     if fill_result.remaining_amount > 0 {
-                        self.insert_bid(order.price, fill_result.remaining_amount, &mut events);
+                        if let Err(e) = self.update_bid(order.id, fill_result.remaining_amount) {
+                            warn!("Failed to update bid order {}: {:?}", order.id, e);
+                        }
+                        events.push(MarketEvent::OrderUpdated(order.id));
                     }
                     events.append(&mut fill_result.into_events());
                 } else {
-                    self.insert_bid(order.price, order.amount, &mut events);
+                    self.insert_bid(order);
+                    events.push(MarketEvent::OrderPlaced(order.id))
                 }
             }
             _ => {
-                self.insert_bid(order.price, order.amount, &mut events);
+                self.insert_bid(order);
+                events.push(MarketEvent::OrderPlaced(order.id))
             }
         }
         events
@@ -311,15 +357,20 @@ impl MatchingEngine {
                 if let Some(fill_result) = level.try_fill(order) {
                     //Creating a order with the unfilled part
                     if fill_result.remaining_amount > 0 {
-                        self.insert_ask(order.price, fill_result.remaining_amount, &mut events);
+                        if let Err(e) = self.update_ask(order.id, fill_result.remaining_amount) {
+                            warn!("Failed to update ask order {}: {:?}", order.id, e);
+                        }
+                        events.push(MarketEvent::OrderUpdated(order.id));
                     }
                     events.append(&mut fill_result.into_events());
                 } else {
-                    self.insert_ask(order.price, order.amount, &mut events);
+                    self.insert_ask(order);
+                    events.push(MarketEvent::OrderPlaced(order.id))
                 }
             }
             _ => {
-                self.insert_ask(order.price, order.amount, &mut events);
+                self.insert_ask(order);
+                events.push(MarketEvent::OrderPlaced(order.id))
             }
         }
         events
@@ -327,47 +378,49 @@ impl MatchingEngine {
 
     fn process_cancel_order(&mut self, order_id: &OrderId) {}
 
-    fn insert_bid(&mut self, price: Price, amount: u64, events: &mut Vec<MarketEvent>) {
-        let order_id = self.id_generator.next();
-        match self.bids.get_mut(&price) {
+    fn insert_bid(&mut self, order: &Order) {
+        match self.bids.get_mut(&order.price) {
             Some(level) => {
-                level.add_order(order_id, amount);
+                level.add_order(order.id, order.amount);
             }
             None => {
                 let mut level = PriceLevel::new();
-                level.add_order(order_id, amount);
-                self.bids.insert(price, level);
+                level.add_order(order.id, order.amount);
+                self.bids.insert(order.price, level);
             }
         }
-        events.push(MarketEvent::OrderPlaced(Box::new((
-            order_id,
-            Order {
-                side: Side::Bid,
-                price,
-                amount,
-            },
-        ))));
+        self.id_index.insert(order.id, (order.price, Side::Bid));
     }
 
-    fn insert_ask(&mut self, price: Price, amount: u64, events: &mut Vec<MarketEvent>) {
-        let order_id = self.id_generator.next();
-        match self.asks.get_mut(&price) {
+    fn update_bid(&mut self, order_id: OrderId, new_amount: u64) -> Result<(), EngineError> {
+        if let Some((price, _)) = self.id_index.get(&order_id) {
+            if let Some(level) = self.bids.get_mut(price) {
+                level.update_order(order_id, new_amount)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_ask(&mut self, order: &Order) {
+        match self.asks.get_mut(&order.price) {
             Some(level) => {
-                level.add_order(order_id, amount);
+                level.add_order(order.id, order.amount);
             }
             None => {
                 let mut level = PriceLevel::new();
-                level.add_order(order_id, amount);
-                self.asks.insert(price, level);
+                level.add_order(order.id, order.amount);
+                self.asks.insert(order.price, level);
             }
         }
-        events.push(MarketEvent::OrderPlaced(Box::new((
-            order_id,
-            Order {
-                side: Side::Ask,
-                price,
-                amount,
-            },
-        ))));
+        self.id_index.insert(order.id, (order.price, Side::Ask));
+    }
+
+    fn update_ask(&mut self, order_id: OrderId, new_amount: u64) -> Result<(), EngineError> {
+        if let Some((price, _)) = self.id_index.get(&order_id) {
+            if let Some(level) = self.asks.get_mut(price) {
+                level.update_order(order_id, new_amount)?;
+            }
+        }
+        Ok(())
     }
 }
