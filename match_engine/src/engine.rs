@@ -265,7 +265,6 @@ pub struct MatchingEngine {
     asks: BTreeMap<Price, PriceLevel>,
     /// Index for fast order lookup by ID
     id_index: HashMap<OrderId, (Price, Side)>,
-    id_generator: IdGenerator,
     price_decimals: u64,
     base_decimals: u64,
     quote_decimals: u64,
@@ -278,37 +277,53 @@ pub struct MatchingEngine {
 
 impl MatchingEngine {
     /// Create a new matching engine with empty order books.
-    pub fn new(
-        id_generator: IdGenerator,
-        price_decimals: u64,
-        base_decimals: u64,
-        quote_decimals: u64,
-    ) -> Self {
+    pub fn new(price_decimals: u64, base_decimals: u64, quote_decimals: u64) -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             id_index: HashMap::new(),
-            id_generator,
             price_decimals,
             base_decimals,
             quote_decimals,
         }
     }
 
-    pub fn run(engine: &mut Self, order_rx: Receiver<OrderEvent>, market_tx: Sender<MarketEvent>) {
+    pub fn run(
+        engine: &mut Self,
+        order_rx: Receiver<OrderEvent>,
+        market_tx: Sender<MarketEvent>,
+        error_tx: Sender<EngineError>,
+    ) {
         loop {
             match order_rx.recv() {
                 Ok(event) => match event {
                     OrderEvent::New(new_order) => {
-                        let events = engine.process_new_order(&new_order);
-                        events.into_iter().for_each(|event| {
-                            //TODO: Handle errors
-                            // I think I should send them to some kind of oneshot channel to the restart the engine from last known state
-                            market_tx.send(event).unwrap();
-                        });
+                        match engine.process_new_order(&new_order) {
+                            Ok(events) => {
+                                events.into_iter().for_each(|event| {
+                                    //TODO: Handle channel errors
+                                    // Such errors mean that the channel is closed, so we must restart the engine
+                                    market_tx.send(event).unwrap();
+                                });
+                            }
+                            Err(err) => {
+                                //TODO: Handle channel errors
+                                error_tx.send(err).unwrap();
+                            }
+                        }
                     }
                     OrderEvent::Cancel(order_id) => {
-                        engine.process_cancel_order(&order_id);
+                        match engine.process_cancel_order(order_id) {
+                            Ok(event) => {
+                                //TODO: Handle channel errors
+                                // Such errors mean that the channel is closed, so we must restart the engine
+                                market_tx.send(event).unwrap();
+                            }
+                            Err(err) => {
+                                //TODO: Handle channel errors
+                                error_tx.send(err).unwrap();
+                            }
+                        }
                     }
                 },
                 Err(_) => break,
@@ -317,23 +332,21 @@ impl MatchingEngine {
     }
 
     // This function must return a bunch of MarketEvents, that are represents the state changes.
-    fn process_new_order(&mut self, new_order: &Order) -> Vec<MarketEvent> {
+    fn process_new_order(&mut self, new_order: &Order) -> Result<Vec<MarketEvent>, EngineError> {
         match new_order.side {
             Side::Bid => self.process_buy_order(new_order),
             Side::Ask => self.process_sell_order(new_order),
         }
     }
 
-    fn process_buy_order(&mut self, order: &Order) -> Vec<MarketEvent> {
+    fn process_buy_order(&mut self, order: &Order) -> Result<Vec<MarketEvent>, EngineError> {
         let mut events = Vec::new();
         match self.asks.iter_mut().next() {
             Some((price, level)) if price <= &order.price => {
                 if let Some(fill_result) = level.try_fill(order) {
-                    //Creating a order with the unfilled part
+                    //Updating a order with the unfilled part
                     if fill_result.remaining_amount > 0 {
-                        if let Err(e) = self.update_bid(order.id, fill_result.remaining_amount) {
-                            warn!("Failed to update bid order {}: {:?}", order.id, e);
-                        }
+                        self.update_bid(order.id, fill_result.remaining_amount)?;
                         events.push(MarketEvent::OrderUpdated(order.id));
                     }
                     events.append(&mut fill_result.into_events());
@@ -347,19 +360,17 @@ impl MatchingEngine {
                 events.push(MarketEvent::OrderPlaced(order.id))
             }
         }
-        events
+        Ok(events)
     }
 
-    fn process_sell_order(&mut self, order: &Order) -> Vec<MarketEvent> {
+    fn process_sell_order(&mut self, order: &Order) -> Result<Vec<MarketEvent>, EngineError> {
         let mut events = Vec::new();
         match self.bids.iter_mut().next() {
             Some((price, level)) if price >= &order.price => {
                 if let Some(fill_result) = level.try_fill(order) {
-                    //Creating a order with the unfilled part
+                    //Updating a order with the unfilled part
                     if fill_result.remaining_amount > 0 {
-                        if let Err(e) = self.update_ask(order.id, fill_result.remaining_amount) {
-                            warn!("Failed to update ask order {}: {:?}", order.id, e);
-                        }
+                        self.update_ask(order.id, fill_result.remaining_amount)?;
                         events.push(MarketEvent::OrderUpdated(order.id));
                     }
                     events.append(&mut fill_result.into_events());
@@ -373,10 +384,34 @@ impl MatchingEngine {
                 events.push(MarketEvent::OrderPlaced(order.id))
             }
         }
-        events
+        Ok(events)
     }
 
-    fn process_cancel_order(&mut self, order_id: &OrderId) {}
+    fn process_cancel_order(&mut self, order_id: OrderId) -> Result<MarketEvent, EngineError> {
+        if let Some((price, side)) = self.id_index.remove(&order_id) {
+            match side {
+                Side::Bid => {
+                    if let Some(level) = self.bids.get_mut(&price) {
+                        level.remove_order(order_id)?;
+                        Ok(MarketEvent::OrderCancelled(order_id))
+                    } else {
+                        //TODO: Provide context?
+                        Err(EngineError::OrderNotFound(order_id))
+                    }
+                }
+                Side::Ask => {
+                    if let Some(level) = self.asks.get_mut(&price) {
+                        level.remove_order(order_id)?;
+                        Ok(MarketEvent::OrderCancelled(order_id))
+                    } else {
+                        Err(EngineError::OrderNotFound(order_id))
+                    }
+                }
+            }
+        } else {
+            Err(EngineError::OrderNotFound(order_id))
+        }
+    }
 
     fn insert_bid(&mut self, order: &Order) {
         match self.bids.get_mut(&order.price) {
