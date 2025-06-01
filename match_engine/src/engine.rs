@@ -2,9 +2,8 @@
 //!
 //! This module provides the main `MatchingEngine` struct and related types
 //! for processing trading orders and generating trades.
-use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use tracing::warn;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::errors::EngineError;
 
@@ -240,24 +239,6 @@ impl PriceLevel {
     }
 }
 
-pub struct IdGenerator {
-    next_id: u64,
-}
-
-//TODO: Move to separate file
-//IdGenerator must be initializable and restorable from the last known id
-impl IdGenerator {
-    pub fn new(init_id: u64) -> Self {
-        IdGenerator { next_id: init_id }
-    }
-
-    pub fn next(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-}
-
 pub struct MatchingEngine {
     /// Buy orders sorted by price (highest first) then time priority
     bids: BTreeMap<Price, PriceLevel>,
@@ -265,38 +246,27 @@ pub struct MatchingEngine {
     asks: BTreeMap<Price, PriceLevel>,
     /// Index for fast order lookup by ID
     id_index: HashMap<OrderId, (Price, Side)>,
-    price_decimals: u64,
-    base_decimals: u64,
-    quote_decimals: u64,
 }
-
-// Engine should have
-// - A run function that processes the incoming event using a crossbeam channel (engine loop)
-// - A new function that creates a new Engine, with a channels
-// - Other internal functions to work with orders and price levels
 
 impl MatchingEngine {
     /// Create a new matching engine with empty order books.
-    pub fn new(price_decimals: u64, base_decimals: u64, quote_decimals: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             id_index: HashMap::new(),
-            price_decimals,
-            base_decimals,
-            quote_decimals,
         }
     }
 
     pub fn run(
         engine: &mut Self,
-        order_rx: Receiver<OrderEvent>,
-        market_tx: Sender<MarketEvent>,
-        error_tx: Sender<EngineError>,
+        mut order_rx: UnboundedReceiver<OrderEvent>,
+        market_tx: UnboundedSender<MarketEvent>,
+        error_tx: UnboundedSender<EngineError>,
     ) {
         loop {
-            match order_rx.recv() {
-                Ok(event) => match event {
+            match order_rx.blocking_recv() {
+                Some(event) => match event {
                     OrderEvent::New(new_order) => {
                         match engine.process_new_order(&new_order) {
                             Ok(events) => {
@@ -326,7 +296,7 @@ impl MatchingEngine {
                         }
                     }
                 },
-                Err(_) => break,
+                None => panic!("Orders channels is closed"),
             }
         }
     }
