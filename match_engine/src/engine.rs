@@ -75,6 +75,7 @@ pub enum OrderEvent {
     Cancel(OrderId),
 }
 
+#[derive(Debug, Clone)]
 pub enum MarketEvent {
     Trade(Box<Trade>),
     OrderCancelled(OrderId),

@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 /// Engine-related errors
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum EngineError {
     #[error("Order not found: {0}")]
     OrderNotFound(u64),
