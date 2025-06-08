@@ -53,7 +53,7 @@ pub enum Side {
 pub struct Order {
     pub id: OrderId,
     pub side: Side,
-    //TODO: Work on decimals processing - use rust decimal crate
+    //TODO: Work on decimals processing
     pub price: Price,
     pub amount: u64,
 }
